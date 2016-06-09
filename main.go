@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"errors"
+	"io"
 	"io/ioutil"
 	"log"
 	"net"
@@ -39,28 +40,46 @@ const (
 
 // A SuperAgent is a object storing all request data for client.
 type SuperAgent struct {
-	Url               string
-	Method            string
-	Header            map[string]string
-	TargetType        string
-	ForceType         string
-	Data              map[string]interface{}
-	SliceData         []interface{}
-	FormData          url.Values
-	QueryData         url.Values
-	BounceToRawString bool
-	RawString         string
-	Client            *http.Client
-	Transport         *http.Transport
-	Cookies           []*http.Cookie
-	Errors            []error
-	BasicAuth         struct{ Username, Password string }
-	Debug             bool
-	CurlCommand       bool
-	logger            *log.Logger
+	Url                   string
+	Method                string
+	Header                map[string]string
+	TargetType            string
+	ForceType             string
+	Data                  map[string]interface{}
+	SliceData             []interface{}
+	FormData              url.Values
+	QueryData             url.Values
+	BounceToRawString     bool
+	RawString             string
+	Client                *http.Client
+	Transport             *http.Transport
+	Cookies               []*http.Cookie
+	Errors                []error
+	BasicAuth             struct{ Username, Password string }
+	Debug                 bool
+	CurlCommand           bool
+	MaxResponseBodyLength int64
+	logger                *log.Logger
 }
 
 var DisableTransportSwap = false
+
+type limitedReadCloser struct {
+	io.ReadCloser
+	N int64
+}
+
+func (l *limitedReadCloser) Read(p []byte) (n int, err error) {
+	if l.N <= 0 {
+		return 0, errors.New("Response body too large")
+	}
+	if int64(len(p)) > l.N {
+		p = p[0:l.N]
+	}
+	n, err = l.ReadCloser.Read(p)
+	l.N -= int64(n)
+	return
+}
 
 // Used to create a new SuperAgent object.
 func New() *SuperAgent {
@@ -94,6 +113,11 @@ func New() *SuperAgent {
 // Enable the debug mode which logs request/response detail
 func (s *SuperAgent) SetDebug(enable bool) *SuperAgent {
 	s.Debug = enable
+	return s
+}
+
+func (s *SuperAgent) SetMaxResponseBodyLength(limit int64) *SuperAgent {
+	s.MaxResponseBodyLength = limit
 	return s
 }
 
@@ -715,7 +739,17 @@ func (s *SuperAgent) EndBytes(callback ...func(response Response, body []byte, e
 		}
 	}
 
-	body, _ := ioutil.ReadAll(resp.Body)
+	var body []byte
+	if s.MaxResponseBodyLength > 0 {
+		reader := &limitedReadCloser{resp.Body, s.MaxResponseBodyLength}
+		body, err = ioutil.ReadAll(reader)
+		if err != nil {
+			s.Errors = append(s.Errors, err)
+			return nil, nil, s.Errors
+		}
+	} else {
+		body, _ = ioutil.ReadAll(resp.Body)
+	}
 	// Reset resp.Body so it can be use again
 	resp.Body = ioutil.NopCloser(bytes.NewBuffer(body))
 	// deep copy response to give it to both return and callback func
@@ -788,7 +822,7 @@ func (s *SuperAgent) MakeRequest() (*http.Request, error) {
 		req.Header.Set(k, v)
 		// Setting the host header is a special case, see this issue: https://github.com/golang/go/issues/7682
 		if strings.EqualFold(k, "host") {
-			req.Host = v;
+			req.Host = v
 		}
 	}
 	// Add all querystring from Query func
